@@ -1,4 +1,5 @@
 require 'benchmark'
+require 'tmpdir'
 
 #
 #  Copyright (c) 2011, SoundCloud Ltd., Rany Keddo, Tobias Bielohlawek
@@ -83,7 +84,7 @@ require 'benchmark'
 class LargeHadronMigration < ActiveRecord::Migration
 
   # id_window must be larger than the number of inserts
-  # added to the journal table. if this is not the case,
+  # added to the changes table. if this is not the case,
   # inserts will be lost in the replay phase.
   def self.large_hadron_migrate(curr_table, *args, &block)
     opts = args.extract_options!.reverse_merge :wait => 0.5,
@@ -127,8 +128,10 @@ class LargeHadronMigration < ActiveRecord::Migration
       insertion_columns = prepare_insertion_columns(new_table, curr_table, default_values)
       raise "insertion_columns empty" if insertion_columns.empty?
 
-      outfile = create_outfile(last_insert_id, insertion_columns, curr_table)
-      load_from_outfile(outfile, new_table)
+      tempfile_for(changes_table).tap do |file|
+        create_to_file(file, last_insert_id, insertion_columns, curr_table)
+        load_from_file(file, new_table)
+      end
 
       rename_tables curr_table => old_table, new_table => curr_table
       cleanup(curr_table)
@@ -152,68 +155,32 @@ class LargeHadronMigration < ActiveRecord::Migration
     end
   end
 
-  def self.create_outfile last_insert_id, insertion_columns, curr_table, sql_condition=''
-    require "tmpdir"
-    temp_file = File.join(Dir.tmpdir, "__large_hadron_#{curr_table}_#{Time.now.to_i}.sql")
-    cols = insertion_columns.map{|k,v| "#{curr_table}.#{v}" }.join(",")
-    sql = %Q|
-      SELECT #{cols} INTO OUTFILE '#{temp_file}'
+  def self.create_to_file(filename, last_insert_id, insertion_columns, curr_table, where = '')
+    execute %Q{
+      SELECT %s INTO OUTFILE '%s'
         FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '"'
         LINES TERMINATED BY '\\n'
-        FROM #{curr_table}
-        WHERE #{curr_table}.id < #{last_insert_id}
-    |
-    if sql_condition != ''
-      sql << "AND #{sql_condition}"   
-    end
-    res = execute sql
-    temp_file
+        FROM %s AS t1
+        WHERE (t1.id < %s) %s
+    } % [
+      insertion_columns.values.map { |keys| "t1.#{keys}" }.join(","),
+      filename,
+      curr_table,
+      last_insert_id,
+      where
+    ]
   end
 
-  def self.load_from_outfile filename, table
-    sql = %Q|
-      LOAD DATA INFILE '#{filename}' 
-      INTO TABLE #{table}
+  def self.load_from_file(filename, table)
+    execute %Q{
+      LOAD DATA INFILE '%s'
+      INTO TABLE %s
       FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '"'
       LINES TERMINATED BY '\\n'
-    |
-    execute sql
-  end
-
-  def self.chunked_insert(last_insert_id, chunk_size, new_table, insertion_columns, curr_table, wait, where = "")
-    # do the inserts in chunks. helps to reduce io contention and keeps the
-    # undo log small.
-    chunks = (last_insert_id / chunk_size.to_f).ceil
-    times = []
-    (1..chunks).each do |chunk|
-
-      times << Benchmark.measure do
-        execute "start transaction"
-
-        execute %Q{
-          insert into %s
-          (%s)
-          select %s
-          from %s
-          where (id between %d and %d) %s
-
-        } % [
-          new_table,
-          insertion_columns.keys.join(","),
-          insertion_columns.values.join(","),
-          curr_table,
-          ((chunk - 1) * chunk_size) + 1,
-          [chunk * chunk_size, last_insert_id].min,
-          where
-        ]
-        execute "COMMIT"
-      end
-
-      say_remaining_estimate(times, chunks, chunk, wait)
-
-      # larger values trade greater inconsistency for less io
-      sleep wait
-    end
+    } % [
+      filename,
+      table
+    ]
   end
 
   def self.chunked_update(last_insert_id, chunk_size, new_table, insertion_columns, curr_table, wait, where = "")
@@ -234,7 +201,7 @@ class LargeHadronMigration < ActiveRecord::Migration
         } % [
           new_table,
           curr_table,
-          insertion_columns.keys.map { |keys| "t1.#{keys} = t2.#{keys}"}.join(","),
+          insertion_columns.keys.map { |keys| "t1.#{keys} = t2.#{keys}" }.join(","),
           ((chunk - 1) * chunk_size) + 1,
           [chunk * chunk_size, last_insert_id].min,
           where
@@ -290,7 +257,7 @@ class LargeHadronMigration < ActiveRecord::Migration
   end
 
   def self.rename_tables(tables = {})
-    execute "rename table %s" % tables.map{ |old_table, new_table| "#{old_table} to #{new_table}" }.join(', ')
+    execute "rename table %s" % tables.map { |old_table, new_table| "#{old_table} to #{new_table}" }.join(', ')
   end
 
   def self.add_trigger_on_action(table, journal_table, action)
@@ -338,23 +305,13 @@ class LargeHadronMigration < ActiveRecord::Migration
     ]
   end
 
-  def self.replay_insert_changes(table, journal_table, chunk_size = 10000, wait = 0.2)
+  def self.replay_insert_changes(table, journal_table)
     last_insert_id = last_insert_id(journal_table)
     columns = prepare_insertion_columns(table, journal_table)
 
-    outfile = create_outfile(last_insert_id, columns, journal_table, "hadron_action = 'insert'")
-    load_from_outfile(outfile, table)
-  end
-
-  def self.replay_delete_changes(table, journal_table)
-    with_master do
-      if connection.select_values("select id from #{journal_table} where hadron_action = 'delete' LIMIT 1").any?
-        execute %Q{
-          delete from #{table} where id in (
-            select id from #{journal_table} where hadron_action = 'delete'
-          )
-        }
-      end
+    tempfile_for(journal_table).tap do |filename|
+      create_to_file(filename, last_insert_id, columns, journal_table, "AND hadron_action = 'insert'")
+      load_from_file(filename, table)
     end
   end
 
@@ -370,6 +327,14 @@ class LargeHadronMigration < ActiveRecord::Migration
       journal_table,
       wait,
       "AND hadron_action = 'update'"
+  end
+
+  def self.replay_delete_changes(table, changes_table)
+    execute %Q{
+      delete from #{table} where id in (
+        select id from #{changes_table} where hadron_action = 'delete'
+      )
+    }
   end
 
   #
@@ -398,5 +363,10 @@ class LargeHadronMigration < ActiveRecord::Migration
 
   def self.tick(col)
     "`#{ col }`"
+  end
+
+  def self.tempfile_for(table)
+    filename = "__large_hadron_%s_%s.sql" % [table, Time.now.strftime("%Y_%m_%d_%H_%M_%S_%3N")]
+    File.join(Dir.tmpdir, filename)
   end
 end
