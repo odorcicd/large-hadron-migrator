@@ -11,7 +11,7 @@ require 'spec'
 require 'spec/autorun'
 
 ActiveRecord::Base.establish_connection(
-  :adapter => 'mysql',
+  :adapter => 'mysql2',
   :database => 'large_hadron_migrator',
   :username => '',
   :host => 'localhost'
@@ -74,13 +74,10 @@ module SpecHelper
   end
 
   def truthiness_rows(table_name1, table_name2, offset = 0, limit = 1000)
-    res_1 = sql("SELECT * FROM #{table_name1} ORDER BY id ASC LIMIT #{limit} OFFSET #{offset}")
-    res_2 = sql("SELECT * FROM #{table_name2} ORDER BY id ASC LIMIT #{limit} OFFSET #{offset}")
+    res_1_hash = sql("SELECT * FROM #{table_name1} ORDER BY id ASC LIMIT #{limit} OFFSET #{offset}").each(:as => :hash).first
+    res_2_hash = sql("SELECT * FROM #{table_name2} ORDER BY id ASC LIMIT #{limit} OFFSET #{offset}").each(:as => :hash).first
 
     limit.times do |i|
-      res_1_hash = res_1.fetch_hash
-      res_2_hash = res_2.fetch_hash
-
       if res_1_hash.nil? || res_2_hash.nil?
         flunk("truthiness rows failed: Expected #{limit} rows, but only #{i} found")
       end
@@ -93,7 +90,7 @@ module SpecHelper
   end
 
   def truthiness_index(table, expected_index_name, indexed_columns, unique)
-    index = sql("SHOW INDEXES FROM #{table}").all_hashes.inject({}) do |a, part|
+    index = sql("SHOW INDEXES FROM #{table}").each(:as => :hash).inject({}) do |a, part|
       index_name = part['Key_name']
       a[index_name] ||= { 'unique' => '0' == part['Non_unique'], 'columns' => [] }
       column_index = part['Seq_in_index'].to_i - 1

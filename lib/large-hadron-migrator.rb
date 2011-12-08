@@ -387,7 +387,7 @@ class LargeHadronMigrator < ActiveRecord::Migration
   end
 
   def self.show_create(t1)
-    (execute "show create table %s" % t1).fetch_row.last
+    (execute "show create table %s" % t1).first.last
   end
 
   def self.tick(col)
